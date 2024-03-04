@@ -6,6 +6,7 @@ use configparser::ini::Ini;
 use log::{info,warn};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 
 use std::time::Duration;
 use std::str;
@@ -16,8 +17,11 @@ use std::borrow::Cow;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //load config
     let mut config = Ini::new();
-    config.load("./config.ini")?;
+    // config.load("./config.ini")?;
     let host = config.get("espuino", "host").unwrap_or(String::from("espuino.local"));
+    let mut directory = config.get("espuino", "path").unwrap_or(String::from("/podcasts/"));
+    if !directory.ends_with("/") {directory.push('/')};
+    let podcast_path = Path::new(&directory);
 
     // process podcast config
     let mut playlists = HashMap::new();
@@ -57,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!("Finished processing podcast \"{}\" ({} elements)", name, playlist.len());
-        playlists.insert(section, playlist);
+        playlists.insert(name, playlist);
     }
     println!("Finished processing podcast feeds.");
 
@@ -78,6 +82,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .send()
         .await?;
 
+
+    for (name, playlist) in playlists {
+        // let path = podcast_path.with_file_name(name).with_extension("m3u");
+        let path = podcast_path.join(name).with_extension("m3u");
+        println!("path: {}", path.display());
+        write_playlist_to_server(&client, &api_url
+            , &playlist
+            , path.to_str().unwrap()).await?;
+    }
+
     // Test API call to /explorer
     let params = [("path", "/")];
     let mut url = api_url.clone();
@@ -89,13 +103,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dirtree: Vec<TreeEntry> = response.json().await?;
     println!("Dirtree:\n{:?}", dirtree);
 
+    let params = [("path", "/podcasts")];
+    let mut url = api_url.clone();
+    url.set_path("/explorer");
+    let response = client.get(url)
+        .query(&params)
+        .send()
+        .await?;
+    let dirtree: Vec<TreeEntry> = response.json().await?;
+    println!("Dirtree:\n{:?}", dirtree);
+
+
+
     Ok(())
 }
 
 #[derive(Deserialize, Debug)]
 struct TreeEntry {
     name: String,
-    isDir: bool
+    dir: Option<bool>
 }
 
 #[derive(Debug)]
