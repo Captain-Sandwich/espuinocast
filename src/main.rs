@@ -1,52 +1,148 @@
 use feed_rs::parser;
 use m3u;
 use podcast_search::{search, Kind, PodcastSearchError};
-use reqwest;
-use std::io::{self, Write};
+use reqwest::{self, Url};
 use configparser::ini::Ini;
-use suppaftp::FtpStream;
 use log::{info,warn};
+use serde::Deserialize;
+use std::collections::HashMap;
 
 use std::time::Duration;
 use std::str;
+use std::borrow::Cow;
 
 
 #[tokio::main]
-async fn main() -> () {
-    println!("Hello, world!");
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    //load config
     let mut config = Ini::new();
-    config.load("./config.ini").unwrap();
-    println!("config: {:?}", config);
+    config.load("./config.ini")?;
+    let host = config.get("espuino", "host").unwrap_or(String::from("espuino.local"));
 
-    let res = search_podcast("the adventure zone");
-    let _ = res.await;
-    let playlist = process_rss("https://feeds.simplecast.com/cYQVc__c").await.unwrap();
-    write_playlist_to_tempfile(&playlist, "./adventurezone.m3u")?;
+    // process podcast config
+    let mut playlists = HashMap::new();
+    for section in config.get_map_ref().keys().filter(|s| s.starts_with("podcast.")) {
+        let name = section.strip_prefix("podcast.").unwrap();
+        println!("Processing podcast \"{}\"", name);
+        let url = match config.get(section, "url") {
+            None => {
+                println!("Section {} is missing a url entry", section);
+                continue},
+            Some(url) => match Url::parse(&url) {
+                Err(err) => {
+                    println!("Error parsing url for \"{}\": {}", section, err);
+                    continue},
+                Ok(url) => url
+            }
+        };
 
-    let mut ftp_stream = FtpStream::connect("espuino.local:21").unwrap();
-    ftp_stream.login("esp32", "esp32").unwrap();
-    let mut ftp_stream = ftp_stream.active_mode(Duration::new(2,0)); // needs to set active mode. Passive mode is not supported in the esp library
-    let _ = ftp_stream.cwd("/SD-Card/podcasts").unwrap();
-    let pwd = ftp_stream.pwd().unwrap();
-    println!("pwd: {}", pwd);
-    let fnames = ftp_stream.feat().unwrap();
-    println!("Fnames: {:?}", fnames);
-    let cursor = ftp_stream.retr_as_buffer("config.ini").unwrap();
-    println!("File: {:?}", str::from_utf8(&cursor.into_inner()).unwrap());
+        let truncate = config.getuint(section, "num").unwrap_or(None).map(|x| x as usize);
+        let reverse = config.getboolcoerce(&section, "reverse").unwrap_or(Some(false)).unwrap_or(false);
+        let to_file = config.get(section, "file");
+
+        let playlist = match process_rss(url.clone(), truncate, reverse).await {
+            Err(err) => {
+                println!("Error processing content from {}: {}", url.as_str(), err);
+                continue},
+            Ok(pls) => pls
+        };
+
+        if let Some(fname) = to_file {
+            println!("Writing playlist file: {}", fname);
+            let mut file = std::fs::File::create(fname)?;
+            let mut writer = m3u::Writer::new(&mut file);
+            for entry in playlist.iter().cloned() {
+                writer.write_entry(&entry).unwrap();
+            }
+        }
+
+        println!("Finished processing podcast \"{}\" ({} elements)", name, playlist.len());
+        playlists.insert(section, playlist);
+    }
+    println!("Finished processing podcast feeds.");
+
+
+    // prepare upload to ESPuino
+    let mut api_url = Url::parse(&format!("http://{}", host))?;
+    api_url.set_path("/explorer");
+
+    // build reqwest client
+    let client = reqwest::Client::builder()
+        .build()?;
+    // try to contact espuino in a blocking fashion
+    println!("Contacting Espuino via web interface (http://espunio.local)");
+    let mut url = api_url.clone();
+    url.set_path("/");
+    client.get(url)
+        .timeout(Duration::new(5,0))
+        .send()
+        .await?;
+
+    // Test API call to /explorer
+    let params = [("path", "/")];
+    let mut url = api_url.clone();
+    url.set_path("/explorer");
+    let response = client.get(url)
+        .query(&params)
+        .send()
+        .await?;
+    let dirtree: Vec<TreeEntry> = response.json().await?;
+    println!("Dirtree:\n{:?}", dirtree);
+
+    Ok(())
 }
 
+#[derive(Deserialize, Debug)]
+struct TreeEntry {
+    name: String,
+    isDir: bool
+}
 
-// async fn write_playlist_to_ftp(ftp: &mut FtpStream, playlist: &Vec<m3u::Entry>, fname: &str, path: &str) -> () {
-//     let mut cursor = std::io::Cursor::new(vec![0; 1024*1024]); // 1 MB buffer
-//     let mut writer = m3u::Writer::new(cursor);
-//     for entry in playlist {
-//         writer.write_entry(entry).unwrap();
-//     }
-//     cursor.set_position(0);
-//     // ftp.
+#[derive(Debug)]
+struct Podcast {
+    name: String,
+    url: Url,
+    truncate: Option<usize>,
+    reverse: bool,
+}
 
-//     unimplemented!()
-// }
+async fn upload_file<T>(client: &reqwest::Client, base_url: &Url, path: &str, bytes: T) -> reqwest::Result<()>
+where T: Into<Cow<'static, [u8]>>,
+{
+    let mut url = base_url.clone();
+    url.set_path("/explorer");
+    // prepare multipart form
+    let part = reqwest::multipart::Part::bytes(bytes);
+    let file = reqwest::multipart::Form::new()
+        .part("file", part);
+
+    let params = [("path", path)]; // prepare query parameters
+
+    client.post(url)
+        .query(&params)
+        .multipart(file) 
+        .send()
+        .await?;
+    Ok(())
+}
+
+async fn write_playlist_to_server(client: &reqwest::Client, base_url: &Url, playlist: &Vec<m3u::Entry>, path: &str) -> reqwest::Result<()> {
+    // first write m3u file to in-memory buffer
+    let buf: Vec<u8> = Vec::with_capacity(1024*1024);
+    let mut cursor = std::io::Cursor::new(buf); // 1 MB buffer
+    {
+        // borrow cursor and give it to m3u writer
+        let mut writer = m3u::Writer::new(&mut cursor);
+        for entry in playlist {
+            writer.write_entry(entry).unwrap();
+        }
+        // writer goes out of scope, cursor can be used again.
+    }
+
+    // second, send file from buffer
+    upload_file(client, base_url, path, cursor.into_inner()).await?;
+    Ok(())
+}
 
 async fn search_podcast(terms: &str) -> Result<(), PodcastSearchError> {
     let search_results_future = search(terms);
@@ -71,20 +167,11 @@ async fn search_podcast(terms: &str) -> Result<(), PodcastSearchError> {
     Ok(())
 }
 
-fn write_playlist_to_tempfile(pls: &Vec<m3u::Entry>, fname: &str) -> io::Result<()> {
-    let mut file = std::fs::File::create(fname).unwrap();
-    let mut writer = m3u::Writer::new(&mut file);
-    for entry in pls {
-        writer.write_entry(entry).unwrap();
-    }
-    Ok(())
-}
-
-async fn process_rss(url: &str) -> reqwest::Result<Vec<m3u::Entry>> {
+async fn process_rss(url: Url, truncate: Option<usize>, reverse: bool) -> reqwest::Result<Vec<m3u::Entry>> {
     let body = reqwest::get(url).await?.text().await?;
     let rss = parser::parse(body.as_bytes()).unwrap();
-    println!("Processing {:?}", rss.title.unwrap().content);
-    let episodes: Vec<_> = rss
+
+    let mut episodes: Vec<_> = rss
         .entries
         .iter()
         .map(|e| {
@@ -113,6 +200,9 @@ async fn process_rss(url: &str) -> reqwest::Result<Vec<m3u::Entry>> {
         })
         .map(|url| m3u::url_entry(url.as_str()).unwrap())
         .collect();
-    // println!("{:?}", episodes);
+
+    if reverse {episodes.reverse()};
+    if let Some(n) = truncate {episodes.truncate(n as usize)};
+
     Ok(episodes)
 }
