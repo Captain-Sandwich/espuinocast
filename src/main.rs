@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Ini::new();
     // config.load("./config.ini")?;
     let host = config.get("espuino", "host").unwrap_or(String::from("espuino.local"));
+    let proxy_url = config.get("espuino", "host");
     let mut directory = config.get("espuino", "path").unwrap_or(String::from("/podcasts/"));
     if !directory.ends_with("/") {directory.push('/')};
     let podcast_path = Path::new(&directory);
@@ -71,14 +72,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     api_url.set_path("/explorer");
 
     // build reqwest client
-    let client = reqwest::Client::builder()
-        .build()?;
-    // try to contact espuino in a blocking fashion
-    println!("Contacting Espuino via web interface (http://espunio.local)");
-    let mut url = api_url.clone();
-    url.set_path("/");
-    client.get(url)
-        .timeout(Duration::new(5,0))
+    let client = match proxy_url {
+        Some(proxy) => reqwest::Client::builder()
+                                    .proxy(reqwest::Proxy::http(proxy)?) // useful for debugging
+                                    .build()?,
+        None => reqwest::Client::new()
+    };
         .send()
         .await?;
 
