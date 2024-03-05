@@ -1,1 +1,4 @@
 /target
+*.m3u
+/.vscode
+Cargo.lock
