@@ -1,6 +1,5 @@
 use feed_rs::parser;
 use m3u;
-use podcast_search::{search, Kind, PodcastSearchError};
 use reqwest::{self, Url};
 use configparser::ini::Ini;
 use log::{info,warn};
@@ -166,29 +165,6 @@ async fn write_playlist_to_server(client: &reqwest::Client, base_url: &Url, play
 
     // second, send file from buffer
     upload_file(client, base_url, path, cursor.into_inner()).await?;
-    Ok(())
-}
-
-async fn search_podcast(terms: &str) -> Result<(), PodcastSearchError> {
-    let search_results_future = search(terms);
-    println!("Searching for \"{}\"", terms);
-
-    // execute:
-    let search_results = search_results_future.await?;
-    println!("Found {} results:", search_results.result_count);
-    for (i, res) in search_results
-        .results
-        .iter()
-        .filter(|&r| r.kind == Some(Kind::Podcast))
-        .enumerate()
-    {
-        println!(
-            "{}:\t{}\n\t{}",
-            i + 1,
-            res.collection_name.clone().unwrap(),
-            res.feed_url.clone().unwrap()
-        );
-    }
     Ok(())
 }
 
