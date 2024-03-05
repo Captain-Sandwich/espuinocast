@@ -1,6 +1,7 @@
 # ESPuinocast - Update podcast playlists on an [ESPuino](https://github.com/biologist79/ESPuino)
 
-![build workflow](https://github.com/Captain-Sandwich/espuinocast/actions/workflows/test-builds.yml/badge.svg)
+![build workflow](https://github.com/Captain-Sandwich/espuinocast/actions/workflows/rust.yml/badge.svg)
+![release](https://github.com/Captain-Sandwich/espuinocast/actions/workflows/release.yml/badge.svg)
 
 ## Idea
 
