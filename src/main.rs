@@ -2,13 +2,12 @@ use feed_rs::parser;
 use m3u;
 use reqwest::{self, Url};
 use configparser::ini::Ini;
-use log::{info,warn};
+// use log::{info,warn};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-use std::time::Duration;
-use std::str;
+// use std::str;
 use std::borrow::Cow;
 
 
@@ -16,7 +15,7 @@ use std::borrow::Cow;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //load config
     let mut config = Ini::new();
-    // config.load("./config.ini")?;
+    config.load("./config.ini")?;
     let host = config.get("espuino", "host").unwrap_or(String::from("espuino.local"));
     let proxy_url = config.get("espuino", "host");
     let mut directory = config.get("espuino", "path").unwrap_or(String::from("/podcasts/"));
@@ -30,11 +29,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Processing podcast \"{}\"", name);
         let url = match config.get(section, "url") {
             None => {
-                println!("Section {} is missing a url entry", section);
+                eprintln!("Section {} is missing a url entry", section);
                 continue},
             Some(url) => match Url::parse(&url) {
                 Err(err) => {
-                    println!("Error parsing url for \"{}\": {}", section, err);
+                    eprintln!("Error parsing url for \"{}\": {}", section, err);
                     continue},
                 Ok(url) => url
             }
@@ -44,21 +43,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reverse = config.getboolcoerce(&section, "reverse").unwrap_or(Some(false)).unwrap_or(false);
         let to_file = config.get(section, "file");
 
+        // get and process podcast
         let playlist = match process_rss(url.clone(), truncate, reverse).await {
             Err(err) => {
-                println!("Error processing content from {}: {}", url.as_str(), err);
+                eprintln!("Error processing content from {}: {}", url.as_str(), err);
                 continue},
             Ok(pls) => pls
         };
 
-        if let Some(fname) = to_file {
-            println!("Writing playlist file: {}", fname);
-            let mut file = std::fs::File::create(fname)?;
-            let mut writer = m3u::Writer::new(&mut file);
-            for entry in playlist.iter().cloned() {
-                writer.write_entry(&entry).unwrap();
-            }
-        }
+
+        if let Some(fname) = to_file { write_m3u(&fname, &playlist)? }
 
         println!("Finished processing podcast \"{}\" ({} elements)", name, playlist.len());
         playlists.insert(name, playlist);
@@ -70,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut api_url = Url::parse(&format!("http://{}", host))?;
     api_url.set_path("/explorer");
 
+    println!("Starting uploads to ESPuino");
     // build reqwest client
     let client = match proxy_url {
         Some(proxy) => reqwest::Client::builder()
@@ -77,21 +72,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .build()?,
         None => reqwest::Client::new()
     };
+
+    // First check, if necessary directories exist
+    let parent = match podcast_path.parent() {
+        Some(p) => p,
+        None => Path::new("/")
+    };
+    let basename = podcast_path.components().last().unwrap().as_os_str().to_str().unwrap();
+    let params = [("path", parent)];
+    let response = client.get(api_url.clone())
+        .query(&params)
         .send()
         .await?;
-
-
+    let dirtree: Vec<TreeEntry> = response.json().await?;
+    let directory_exists = dirtree.iter().any(|item| (item.name == basename) && (item.dir == Some(true)));
+    if !directory_exists {
+        println!("Directory does not exist. Creating {:?}", podcast_path.as_os_str());
+        let params = [("path", podcast_path)];
+        client.put(api_url.clone())
+            .query(&params)
+            .send()
+            .await?;
+    }
     for (name, playlist) in playlists {
         // let path = podcast_path.with_file_name(name).with_extension("m3u");
         let path = podcast_path.join(name).with_extension("m3u");
-        println!("path: {}", path.display());
         write_playlist_to_server(&client, &api_url
             , &playlist
             , path.to_str().unwrap()).await?;
     }
 
-    // Test API call to /explorer
-    let params = [("path", "/")];
+    // list podcast directory
+    let params = [("path", podcast_path)];
     let mut url = api_url.clone();
     url.set_path("/explorer");
     let response = client.get(url)
@@ -100,18 +112,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let dirtree: Vec<TreeEntry> = response.json().await?;
     println!("Dirtree:\n{:?}", dirtree);
-
-    let params = [("path", "/podcasts")];
-    let mut url = api_url.clone();
-    url.set_path("/explorer");
-    let response = client.get(url)
-        .query(&params)
-        .send()
-        .await?;
-    let dirtree: Vec<TreeEntry> = response.json().await?;
-    println!("Dirtree:\n{:?}", dirtree);
-
-
 
     Ok(())
 }
@@ -135,16 +135,24 @@ where T: Into<Cow<'static, [u8]>>,
 {
     let mut url = base_url.clone();
     url.set_path("/explorer");
+
+    let path = Path::new(path);
+    let directory = path.parent().unwrap();
+    let fname = path.file_name().unwrap().to_owned().into_string().unwrap();
+
     // prepare multipart form
-    let part = reqwest::multipart::Part::bytes(bytes);
-    let file = reqwest::multipart::Form::new()
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(fname)
+        .mime_str("application/octet-stream")?;
+
+    let form = reqwest::multipart::Form::new()
         .part("file", part);
 
-    let params = [("path", path)]; // prepare query parameters
+    let params = [("path", directory)]; // prepare query parameters
 
     client.post(url)
         .query(&params)
-        .multipart(file) 
+        .multipart(form)
         .send()
         .await?;
     Ok(())
@@ -206,4 +214,13 @@ async fn process_rss(url: Url, truncate: Option<usize>, reverse: bool) -> reqwes
     if let Some(n) = truncate {episodes.truncate(n as usize)};
 
     Ok(episodes)
+}
+        
+fn write_m3u(path: &str, playlist: &Vec<m3u::Entry>) -> std::io::Result<()> {
+            let mut file = std::fs::File::create(path)?;
+            let mut writer = m3u::Writer::new(&mut file);
+            for entry in playlist.iter().cloned() {
+                writer.write_entry(&entry).unwrap();
+            }
+            Ok(())
 }
