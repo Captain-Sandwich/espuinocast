@@ -4,19 +4,41 @@ use reqwest::{self, Url};
 use configparser::ini::Ini;
 // use log::{info,warn};
 use serde::Deserialize;
+use clap::Parser;
 use std::collections::HashMap;
 use std::path::Path;
-
-// use std::str;
 use std::borrow::Cow;
 
+/// ESPuino podcast helper
+/// Converts podcast feeds to m3u playlists and writes them to an ESPuino.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about=None)]
+struct Args {
+    /// Configuration file
+    #[arg(short, long, default_value_t = String::from("./config.ini"), value_name = "FILE")]
+    config: String,
+
+    /// ESPuino host, name or IP, overrides configuration 
+    #[arg(short, long)]
+    address:Option<String>,
+
+   /// forces playlists to files for all podcasts
+   #[arg(short, long)]
+   force_write: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    //load config
+    //parse arguments
+    let args = Args::parse();
+
+    //load config, override with cli args if necessary
     let mut config = Ini::new();
-    config.load("./config.ini")?;
-    let host = config.get("espuino", "host").unwrap_or(String::from("espuino.local"));
+    config.load(args.config)?;
+    let host = match args.address {
+        Some(x) => x,
+        None => config.get("espuino", "host").unwrap_or(String::from("espuino.local"))
+    };
     let proxy_url = config.get("espuino", "host");
     let mut directory = config.get("espuino", "path").unwrap_or(String::from("/podcasts/"));
     if !directory.ends_with("/") {directory.push('/')};
@@ -41,7 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let truncate = config.getuint(section, "num").unwrap_or(None).map(|x| x as usize);
         let reverse = config.getboolcoerce(&section, "reverse").unwrap_or(Some(false)).unwrap_or(false);
-        let to_file = config.get(section, "file");
+        let to_file = 
+            if args.force_write
+                { Some(format!("./{}.m3u", name)) } else
+                {config.get(section, "file")};
 
         // get and process podcast
         let playlist = match process_rss(url.clone(), truncate, reverse).await {
