@@ -18,8 +18,6 @@ The executable looks for a config file `config.ini` in its working directory. Th
 [espuino]
 host = espuino.local # default espuino.local; espuino host name or ip address
 path = /podcasts # default: /podcasts; where to store playlists on the espuino, must exist already
-proxy = http://localhost:8080 # optional; http proxy address. leave out for direct connection
-
 
 # The names of all other config blocks start with 'podcast.'. The part after that is used as the
 # playlist filename on the espuino.
