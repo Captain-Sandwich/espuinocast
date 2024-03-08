@@ -91,12 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting uploads to ESPuino");
     // build reqwest client
-    let client = match proxy_url {
-        Some(proxy) => reqwest::Client::builder()
-                                    .proxy(reqwest::Proxy::http(proxy)?) // useful for debugging
-                                    .build()?,
-        None => reqwest::Client::new()
-    };
+    let client = reqwest::Client::new();
 
     // First check, if necessary directories exist
     let parent = match podcast_path.parent() {
